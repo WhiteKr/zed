@@ -1328,16 +1328,25 @@ extern "C" fn window_did_change_occlusion_state(this: &Object, _: Sel, _: id) {
     let window_state = unsafe { get_window_state(this) };
     let lock = &mut *window_state.lock();
     unsafe {
-        if let Some(display_link) = lock.display_link.as_mut() {
-            if lock
-                .native_window
-                .occlusionState()
-                .contains(NSWindowOcclusionState::NSWindowOcclusionStateVisible)
-            {
+        if lock
+            .native_window
+            .occlusionState()
+            .contains(NSWindowOcclusionState::NSWindowOcclusionStateVisible)
+        {
+            if let Some(display_link) = lock.display_link.as_mut() {
                 display_link.start().log_err();
             } else {
-                display_link.stop().log_err();
+                let display_id = display_id_for_screen(lock.native_window.screen());
+                if let Some(mut display_link) =
+                    DisplayLink::new(display_id, lock.native_view.as_ptr() as *mut c_void, step)
+                        .log_err()
+                {
+                    display_link.start().log_err();
+                    lock.display_link = Some(display_link);
+                }
             }
+        } else if let Some(display_link) = lock.display_link.as_mut() {
+            display_link.stop().log_err();
         }
     }
 }
