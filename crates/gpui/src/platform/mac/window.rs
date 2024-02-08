@@ -1,18 +1,11 @@
 use super::{global_bounds_from_ns_rect, ns_string, MacDisplay, MetalRenderer, NSRange};
 use crate::{
-    dispatch_get_main_queue,
-    dispatch_sys::{
-        _dispatch_source_type_data_add, dispatch_resume, dispatch_set_context,
-        dispatch_source_create, dispatch_source_merge_data, dispatch_source_s,
-        dispatch_source_set_event_handler_f, dispatch_source_t,
-    },
-    global_bounds_to_ns_rect,
-    platform::PlatformInputHandler,
-    point, px, size, AnyWindowHandle, Bounds, CVDisplayLink, CVTimeStamp, DisplayLink,
-    ExternalPaths, FileDropEvent, ForegroundExecutor, GlobalPixels, KeyDownEvent, Keystroke,
-    Modifiers, ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
-    Pixels, PlatformAtlas, PlatformDisplay, PlatformInput, PlatformWindow, Point, PromptLevel,
-    Size, Timer, WindowAppearance, WindowBounds, WindowKind, WindowOptions,
+    global_bounds_to_ns_rect, platform::PlatformInputHandler, point, px, size, AnyWindowHandle,
+    Bounds, DisplayLink, ExternalPaths, FileDropEvent, ForegroundExecutor, GlobalPixels,
+    KeyDownEvent, Keystroke, Modifiers, ModifiersChangedEvent, MouseButton, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, Pixels, PlatformAtlas, PlatformDisplay, PlatformInput,
+    PlatformWindow, Point, PromptLevel, Size, Timer, WindowAppearance, WindowBounds, WindowKind,
+    WindowOptions,
 };
 use block::ConcreteBlock;
 use cocoa::{
@@ -24,8 +17,8 @@ use cocoa::{
     },
     base::{id, nil},
     foundation::{
-        NSArray, NSAutoreleasePool, NSDefaultRunLoopMode, NSDictionary, NSFastEnumeration,
-        NSInteger, NSPoint, NSRect, NSSize, NSString, NSUInteger,
+        NSArray, NSAutoreleasePool, NSDictionary, NSFastEnumeration, NSInteger, NSPoint, NSRect,
+        NSSize, NSString, NSUInteger,
     },
 };
 use core_graphics::display::{CGDirectDisplayID, CGRect};
@@ -58,6 +51,7 @@ use std::{
     sync::{Arc, Weak},
     time::Duration,
 };
+use util::ResultExt;
 
 const WINDOW_STATE_IVAR: &str = "windowState";
 
@@ -176,7 +170,6 @@ unsafe fn build_classes() {
             sel!(displayLayer:),
             display_layer as extern "C" fn(&Object, Sel, id),
         );
-        decl.add_method(sel!(step:), step as extern "C" fn(&Object, Sel, id));
 
         decl.add_protocol(Protocol::get("NSTextInputClient").unwrap());
         decl.add_method(
@@ -338,7 +331,7 @@ struct MacWindowState {
     executor: ForegroundExecutor,
     native_window: id,
     native_view: NonNull<Object>,
-    display_link: id,
+    display_link: Option<DisplayLink>,
     renderer: MetalRenderer,
     kind: WindowKind,
     request_frame_callback: Option<Box<dyn FnMut()>>,
@@ -544,7 +537,7 @@ impl MacWindow {
                 executor,
                 native_window,
                 native_view: NonNull::new_unchecked(native_view),
-                display_link: nil,
+                display_link: None,
                 renderer: MetalRenderer::new(instance_buffer_pool),
                 kind: options.kind,
                 request_frame_callback: None,
@@ -700,74 +693,11 @@ impl MacWindow {
     }
 }
 
-unsafe fn start_display_link(native_screen: id, native_view: id) -> id {
-    unsafe extern "C" fn display_link_callback(
-        display_link_out: *mut CVDisplayLink,
-        current_time: *const CVTimeStamp,
-        output_time: *const CVTimeStamp,
-        flags_in: i64,
-        flags_out: *mut i64,
-        frame_requests: *mut c_void,
-    ) -> i32 {
-        let frame_requests = frame_requests as dispatch_source_t;
-        dispatch_source_merge_data(frame_requests, 1);
-        0
-    }
-
-    let display_id = display_id_for_screen(native_screen);
-    let frame_requests = dispatch_source_create(
-        &_dispatch_source_type_data_add,
-        0,
-        0,
-        dispatch_get_main_queue(),
-    );
-    dispatch_set_context(
-        crate::dispatch_sys::dispatch_object_t {
-            _ds: frame_requests,
-        },
-        native_view as *mut c_void,
-    );
-    dispatch_source_set_event_handler_f(frame_requests, Some(foo));
-    dispatch_resume(crate::dispatch_sys::dispatch_object_t {
-        _ds: frame_requests,
-    });
-    let display_link = DisplayLink::start(
-        display_id,
-        display_link_callback,
-        frame_requests as *mut c_void,
-    )
-    .unwrap();
-    mem::forget(display_link);
-
-    // let max_fps: NSInteger = msg_send![native_screen, maximumFramesPerSecond];
-    // dbg!(max_fps);
-    // let display_link: id =
-    //     msg_send![native_screen, displayLinkWithTarget: native_view selector: sel!(step:)];
-    // let _: () = msg_send![display_link, setPreferredFramesPerSecond: max_fps];
-    // let main_run_loop: id = msg_send![class!(NSRunLoop), mainRunLoop];
-    // let _: () = msg_send![display_link, addToRunLoop: main_run_loop forMode: NSDefaultRunLoopMode];
-    // display_link
-    //
-    nil
-}
-
-unsafe extern "C" fn foo(view: *mut c_void) {
-    let view = view as id;
-    let window_state = unsafe { get_window_state(&*view) };
-    let mut lock = window_state.lock();
-
-    if let Some(mut callback) = lock.request_frame_callback.take() {
-        drop(lock);
-        callback();
-        window_state.lock().request_frame_callback = Some(callback);
-    }
-}
-
 impl Drop for MacWindow {
     fn drop(&mut self) {
         let mut this = self.0.lock();
         let window = this.native_window;
-        this.display_link = nil;
+        this.display_link.take();
         this.executor
             .spawn(async move {
                 unsafe {
@@ -1396,17 +1326,18 @@ extern "C" fn cancel_operation(this: &Object, _sel: Sel, _sender: id) {
 
 extern "C" fn window_did_change_occlusion_state(this: &Object, _: Sel, _: id) {
     let window_state = unsafe { get_window_state(this) };
-    let mut lock = window_state.lock();
+    let lock = &mut *window_state.lock();
     unsafe {
-        if lock
-            .native_window
-            .occlusionState()
-            .contains(NSWindowOcclusionState::NSWindowOcclusionStateVisible)
-        {
-            lock.display_link =
-                start_display_link(lock.native_window.screen(), lock.native_view.as_ptr());
-        } else {
-            lock.display_link = nil;
+        if let Some(display_link) = lock.display_link.as_mut() {
+            if lock
+                .native_window
+                .occlusionState()
+                .contains(NSWindowOcclusionState::NSWindowOcclusionStateVisible)
+            {
+                display_link.start().log_err();
+            } else {
+                display_link.stop().log_err();
+            }
         }
     }
 }
@@ -1449,10 +1380,13 @@ extern "C" fn window_did_change_screen(this: &Object, _: Sel, _: id) {
     let mut lock = window_state.as_ref().lock();
     unsafe {
         let screen = lock.native_window.screen();
-        if screen == nil {
-            lock.display_link = nil;
-        } else {
-            lock.display_link = start_display_link(screen, lock.native_view.as_ptr());
+        let display_id = display_id_for_screen(screen);
+        lock.display_link.take();
+        if let Some(mut display_link) =
+            DisplayLink::new(display_id, lock.native_view.as_ptr() as *mut c_void, step).log_err()
+        {
+            display_link.start().log_err();
+            lock.display_link = Some(display_link);
         }
     }
 }
@@ -1606,20 +1540,15 @@ extern "C" fn display_layer(this: &Object, _: Sel, _: id) {
     }
 }
 
-extern "C" fn step(this: &Object, _: Sel, display_link: id) {
-    let window_state = unsafe { get_window_state(this) };
+unsafe extern "C" fn step(view: *mut c_void) {
+    let view = view as id;
+    let window_state = unsafe { get_window_state(&*view) };
     let mut lock = window_state.lock();
 
-    if lock.display_link == display_link {
-        if let Some(mut callback) = lock.request_frame_callback.take() {
-            drop(lock);
-            callback();
-            window_state.lock().request_frame_callback = Some(callback);
-        }
-    } else {
-        unsafe {
-            let _: () = msg_send![display_link, invalidate];
-        }
+    if let Some(mut callback) = lock.request_frame_callback.take() {
+        drop(lock);
+        callback();
+        window_state.lock().request_frame_callback = Some(callback);
     }
 }
 
