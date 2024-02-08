@@ -1,10 +1,18 @@
 use super::{global_bounds_from_ns_rect, ns_string, MacDisplay, MetalRenderer, NSRange};
 use crate::{
-    global_bounds_to_ns_rect, platform::PlatformInputHandler, point, px, size, AnyWindowHandle,
-    Bounds, ExternalPaths, FileDropEvent, ForegroundExecutor, GlobalPixels, KeyDownEvent,
-    Keystroke, Modifiers, ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, Pixels, PlatformAtlas, PlatformDisplay, PlatformInput, PlatformWindow, Point,
-    PromptLevel, Size, Timer, WindowAppearance, WindowBounds, WindowKind, WindowOptions,
+    dispatch_get_main_queue,
+    dispatch_sys::{
+        _dispatch_source_type_data_add, dispatch_resume, dispatch_set_context,
+        dispatch_source_create, dispatch_source_merge_data, dispatch_source_s,
+        dispatch_source_set_event_handler_f, dispatch_source_t,
+    },
+    global_bounds_to_ns_rect,
+    platform::PlatformInputHandler,
+    point, px, size, AnyWindowHandle, Bounds, CVDisplayLink, CVTimeStamp, DisplayLink,
+    ExternalPaths, FileDropEvent, ForegroundExecutor, GlobalPixels, KeyDownEvent, Keystroke,
+    Modifiers, ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
+    Pixels, PlatformAtlas, PlatformDisplay, PlatformInput, PlatformWindow, Point, PromptLevel,
+    Size, Timer, WindowAppearance, WindowBounds, WindowKind, WindowOptions,
 };
 use block::ConcreteBlock;
 use cocoa::{
@@ -20,7 +28,7 @@ use cocoa::{
         NSInteger, NSPoint, NSRect, NSSize, NSString, NSUInteger,
     },
 };
-use core_graphics::display::CGRect;
+use core_graphics::display::{CGDirectDisplayID, CGRect};
 use ctor::ctor;
 use foreign_types::ForeignTypeRef;
 use futures::channel::oneshot;
@@ -506,11 +514,8 @@ impl MacWindow {
             let count: u64 = cocoa::foundation::NSArray::count(screens);
             for i in 0..count {
                 let screen = cocoa::foundation::NSArray::objectAtIndex(screens, i);
-                let device_description = NSScreen::deviceDescription(screen);
-                let screen_number_key: id = NSString::alloc(nil).init_str("NSScreenNumber");
-                let screen_number = device_description.objectForKey_(screen_number_key);
-                let screen_number: NSUInteger = msg_send![screen_number, unsignedIntegerValue];
-                if screen_number as u32 == display.id().0 {
+                let display_id = display_id_for_screen(screen);
+                if display_id == display.id().0 {
                     target_screen = screen;
                     break;
                 }
@@ -696,11 +701,66 @@ impl MacWindow {
 }
 
 unsafe fn start_display_link(native_screen: id, native_view: id) -> id {
-    let display_link: id =
-        msg_send![native_screen, displayLinkWithTarget: native_view selector: sel!(step:)];
-    let main_run_loop: id = msg_send![class!(NSRunLoop), mainRunLoop];
-    let _: () = msg_send![display_link, addToRunLoop: main_run_loop forMode: NSDefaultRunLoopMode];
-    display_link
+    unsafe extern "C" fn display_link_callback(
+        display_link_out: *mut CVDisplayLink,
+        current_time: *const CVTimeStamp,
+        output_time: *const CVTimeStamp,
+        flags_in: i64,
+        flags_out: *mut i64,
+        frame_requests: *mut c_void,
+    ) -> i32 {
+        let frame_requests = frame_requests as dispatch_source_t;
+        dispatch_source_merge_data(frame_requests, 1);
+        0
+    }
+
+    let display_id = display_id_for_screen(native_screen);
+    let frame_requests = dispatch_source_create(
+        &_dispatch_source_type_data_add,
+        0,
+        0,
+        dispatch_get_main_queue(),
+    );
+    dispatch_set_context(
+        crate::dispatch_sys::dispatch_object_t {
+            _ds: frame_requests,
+        },
+        native_view as *mut c_void,
+    );
+    dispatch_source_set_event_handler_f(frame_requests, Some(foo));
+    dispatch_resume(crate::dispatch_sys::dispatch_object_t {
+        _ds: frame_requests,
+    });
+    let display_link = DisplayLink::start(
+        display_id,
+        display_link_callback,
+        frame_requests as *mut c_void,
+    )
+    .unwrap();
+    mem::forget(display_link);
+
+    // let max_fps: NSInteger = msg_send![native_screen, maximumFramesPerSecond];
+    // dbg!(max_fps);
+    // let display_link: id =
+    //     msg_send![native_screen, displayLinkWithTarget: native_view selector: sel!(step:)];
+    // let _: () = msg_send![display_link, setPreferredFramesPerSecond: max_fps];
+    // let main_run_loop: id = msg_send![class!(NSRunLoop), mainRunLoop];
+    // let _: () = msg_send![display_link, addToRunLoop: main_run_loop forMode: NSDefaultRunLoopMode];
+    // display_link
+    //
+    nil
+}
+
+unsafe extern "C" fn foo(view: *mut c_void) {
+    let view = view as id;
+    let window_state = unsafe { get_window_state(&*view) };
+    let mut lock = window_state.lock();
+
+    if let Some(mut callback) = lock.request_frame_callback.take() {
+        drop(lock);
+        callback();
+        window_state.lock().request_frame_callback = Some(callback);
+    }
 }
 
 impl Drop for MacWindow {
@@ -1881,4 +1941,12 @@ where
     } else {
         None
     }
+}
+
+unsafe fn display_id_for_screen(screen: id) -> CGDirectDisplayID {
+    let device_description = NSScreen::deviceDescription(screen);
+    let screen_number_key: id = NSString::alloc(nil).init_str("NSScreenNumber");
+    let screen_number = device_description.objectForKey_(screen_number_key);
+    let screen_number: NSUInteger = msg_send![screen_number, unsignedIntegerValue];
+    screen_number as CGDirectDisplayID
 }
