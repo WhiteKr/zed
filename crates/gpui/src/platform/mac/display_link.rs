@@ -9,6 +9,7 @@ use crate::{
 use anyhow::Result;
 use core_graphics::display::CGDirectDisplayID;
 use std::ffi::c_void;
+use util::ResultExt;
 
 pub struct DisplayLink {
     display_link: sys::DisplayLink,
@@ -22,11 +23,11 @@ impl DisplayLink {
         callback: unsafe extern "C" fn(*mut c_void),
     ) -> Result<DisplayLink> {
         unsafe extern "C" fn display_link_callback(
-            display_link_out: *mut sys::CVDisplayLink,
-            current_time: *const sys::CVTimeStamp,
-            output_time: *const sys::CVTimeStamp,
-            flags_in: i64,
-            flags_out: *mut i64,
+            _display_link_out: *mut sys::CVDisplayLink,
+            _current_time: *const sys::CVTimeStamp,
+            _output_time: *const sys::CVTimeStamp,
+            _flags_in: i64,
+            _flags_out: *mut i64,
             frame_requests: *mut c_void,
         ) -> i32 {
             let frame_requests = frame_requests as dispatch_source_t;
@@ -85,7 +86,7 @@ impl DisplayLink {
 
 impl Drop for DisplayLink {
     fn drop(&mut self) {
-        self.stop();
+        self.stop().log_err();
         unsafe {
             dispatch_source_cancel(self.frame_requests);
         }
